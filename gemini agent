@@ -1,0 +1,231 @@
+# =============================================================================
+# gemini_agent.py -- OptoScan Gemini Clinical Diagnostic Agent
+# Uses the new google-genai SDK (replaces deprecated google-generativeai)
+# =============================================================================
+from __future__ import annotations
+import os
+import time
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+# -- Load .env automatically --------------------------------------------------
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path, override=True)
+        logger.info("Loaded .env from %s", _env_path)
+except ImportError:
+    pass
+
+# -- Import new google-genai SDK ----------------------------------------------
+try:
+    from google import genai
+    from google.genai import errors as _genai_errors
+    _GENAI_AVAILABLE = True
+except ImportError:
+    _GENAI_AVAILABLE = False
+    logger.warning("google-genai not installed. Run: pip install google-genai")
+
+# -- Clinical prompt ----------------------------------------------------------
+_PROMPT = (
+    "You are a biomedical signal-analysis assistant embedded in a real-time "
+    "optical biopsy probe called OptoScan. "
+    "The probe uses an 850 nm IR LED and a BPW34 PIN photodiode to measure "
+    "tissue reflectance. ADC readings range from 0 (total absorption) to "
+    "1023 (total reflection); the nominal baseline for healthy tissue is 512.\n\n"
+    "Current reading: {value} ADC counts "
+    "(normalised reflectance: {reflectance:.4f}).\n\n"
+    "In exactly 2 concise clinical sentences, interpret this reading with respect "
+    "to tissue density and flag potential anomalies such as hematomas "
+    "(low reflectance, ADC < 340), normal tissue (ADC 340-680), or "
+    "fibrous / scar tissue (high reflectance, ADC > 680). "
+    "Do not include disclaimers or bullet points -- write as a senior clinician "
+    "would in a diagnostic note."
+)
+
+# -- Model priority list (tried in order) -------------------------------------
+_MODEL_PRIORITY = [
+    "gemini-1.5-flash-8b",     # very fast, high availability
+    "gemini-1.5-pro",          # most capable
+    "gemini-2.0-flash-lite",   # next-gen lite
+    "gemini-2.0-flash",        # next-gen
+    "gemini-1.0-pro",          # reliable legacy
+]
+
+# -- Throttle -----------------------------------------------------------------
+_MIN_INTERVAL_S = 60   # minimum seconds between cached API calls
+_MIN_ADC_DELTA  = 50   # minimum ADC change to bypass cache
+
+
+@dataclass
+class GeminiInsight:
+    """Result of one Gemini API call."""
+    text:        str
+    adc_value:   int
+    timestamp:   float     = field(default_factory=time.time)
+    error:       str|None  = None
+    retry_after: int|None  = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None and bool(self.text)
+
+    @property
+    def is_rate_limited(self) -> bool:
+        return self.error == "RATE_LIMITED"
+
+    @property
+    def is_key_invalid(self) -> bool:
+        return self.error == "KEY_INVALID"
+
+    @property
+    def is_quota_zero(self) -> bool:
+        return self.error == "QUOTA_ZERO"
+
+
+class GeminiAgent:
+    """
+    Wraps the new Google GenAI SDK with per-minute throttling,
+    model auto-discovery, and clean error classification.
+    """
+
+    def __init__(self, api_key: str | None = None) -> None:
+        self.model_name: str       = _MODEL_PRIORITY[0]
+        self._client               = None
+        self._configured           = False
+        self._last_insight: GeminiInsight | None = None
+        self._last_adc:     int    | None = None
+
+        key = (api_key or "").strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+        logger.info("GeminiAgent init — key present: %s", bool(key))
+        if key and _GENAI_AVAILABLE:
+            self._setup(key)
+
+    # -------------------------------------------------------------------------
+    @property
+    def is_ready(self) -> bool:
+        return self._configured and self._client is not None
+
+    def configure(self, api_key: str) -> bool:
+        """Re-configure with a new key. Clears cached insight."""
+        self._last_insight = None
+        self._last_adc     = None
+        return self._setup(api_key.strip())
+
+    def get_insight(self, adc_value: int, force: bool = False) -> GeminiInsight | None:
+        """
+        Return a GeminiInsight for adc_value.
+        - Returns None if not configured.
+        - Serves from cache if value/time haven't changed enough (unless force=True).
+        - Errors are NEVER cached — every button click tries a fresh API call.
+        """
+        if not self.is_ready:
+            return None
+
+        now = time.time()
+
+        # Serve from cache only for SUCCESSFUL insights
+        if (
+            not force
+            and self._last_insight is not None
+            and self._last_insight.ok                           # only cache successes
+            and (now - self._last_insight.timestamp) < _MIN_INTERVAL_S
+            and abs(adc_value - (self._last_adc or adc_value)) < _MIN_ADC_DELTA
+        ):
+            return self._last_insight
+
+        prompt = _PROMPT.format(value=adc_value, reflectance=adc_value / 1023.0)
+
+        models_to_try = [self.model_name] + [
+            m for m in _MODEL_PRIORITY if m != self.model_name
+        ]
+
+        for model_name in models_to_try:
+            try:
+                if model_name != self.model_name:
+                    logger.info("Switching to model: %s", model_name)
+                    self.model_name = model_name
+
+                response = self._client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                text    = response.text.strip()
+                insight = GeminiInsight(text=text, adc_value=adc_value)
+                logger.info("Gemini OK [%s] ADC=%d (%d chars)", model_name, adc_value, len(text))
+                self._last_insight = insight
+                self._last_adc     = adc_value
+                return insight
+
+            except Exception as exc:
+                err = str(exc)
+                code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+
+                # -- 400: Key invalid -----------------------------------------
+                if "400" in err or "API_KEY_INVALID" in err or code == 400:
+                    logger.error("Invalid API key (400)")
+                    self._configured = False
+                    self._client     = None
+                    return GeminiInsight(text="", adc_value=adc_value, error="KEY_INVALID")
+
+                # -- 404: Model not available for this key/region --------------
+                elif "404" in err or code == 404:
+                    logger.warning("Model %s not found (404), trying next", model_name)
+                    continue
+
+                # -- 429: Rate limit -------------------------------------------
+                elif "429" in err or code == 429:
+                    # ── Only true QUOTA_ZERO if the limit itself is 0 ─────────
+                    # "limit: 0" and NO "exhausted" signal typically means a
+                    # project-level block rather than a per-minute limit.
+                    if ("limit: 0" in err or '"value": "0"' in err) and "exhausted" not in err.lower():
+                        logger.error("Quota is ZERO for this project")
+                        return GeminiInsight(text="", adc_value=adc_value, error="QUOTA_ZERO")
+
+                    import re
+                    m = re.search(r"retry.{0,20}?(\d{1,4})\s*s", err, re.I)
+                    wait = int(m.group(1)) if m else 60
+                    logger.warning("429 on %s — retry in %ds, trying next model", model_name, wait)
+                    continue   # try next model (each has independent quota)
+
+                # -- Other error ----------------------------------------------
+                else:
+                    logger.error("Gemini error on %s: %s", model_name, exc)
+                    return GeminiInsight(text="", adc_value=adc_value, error=err[:300])
+
+        # All models returned 404 or 429
+        return GeminiInsight(
+            text="", adc_value=adc_value,
+            error="RATE_LIMITED",
+            retry_after=60,
+        )
+
+    # -------------------------------------------------------------------------
+    def _setup(self, key: str) -> bool:
+        if not _GENAI_AVAILABLE or not key:
+            return False
+        try:
+            client = genai.Client(api_key=key)
+            # Probe: list available models (doesn't consume quota)
+            models = [m.name for m in client.models.list()]
+            # Pick best available model from our priority list
+            for preferred in _MODEL_PRIORITY:
+                full_name = f"models/{preferred}"
+                if any(preferred in m or full_name in m for m in models):
+                    self.model_name = preferred
+                    break
+            else:
+                self.model_name = _MODEL_PRIORITY[0]   # fallback
+            self._client     = client
+            self._configured = True
+            logger.info("GeminiAgent ready — model: %s", self.model_name)
+            return True
+        except Exception as exc:
+            logger.error("GeminiAgent setup failed: %s", exc)
+            self._configured = False
+            self._client     = None
+            return False
