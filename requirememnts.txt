@@ -1,0 +1,27 @@
+# OptoScan — Python Dependencies
+# Install with:  pip install -r requirements.txt
+
+# ── Core UI & Visualization ──────────────────────────────────────────────────
+streamlit>=1.32.0
+plotly>=5.18.0
+
+# ── Serial / Bluetooth Communication ─────────────────────────────────────────
+pyserial>=3.5
+
+# ── Numerical / Data ─────────────────────────────────────────────────────────
+numpy>=1.26.0
+pandas>=2.2.0
+
+# ── ML Model Support ─────────────────────────────────────────────────────────
+scikit-learn>=1.4.0     # pickle / joblib models
+joblib>=1.3.0           # efficient model serialization
+
+# ── Gemini AI Clinical Insights ───────────────────────────────────────────────
+google-genai>=1.0.0             # new Google GenAI SDK (replaces google-generativeai)
+python-dotenv>=1.0.0         # load GEMINI_API_KEY from .env file
+
+# ── Optional: Keras / TensorFlow (uncomment if using .h5 models) ─────────────
+# tensorflow>=2.15.0
+
+# ── Optional: ONNX Runtime (uncomment if using .onnx models) ─────────────────
+# onnxruntime>=1.17.0
